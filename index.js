@@ -35,11 +35,18 @@ const SYSTEM_INSTRUCTION =
   'verdad, dejas el sarcasmo por completo. Respondes en español, breve y ' +
   'natural, como si hablaras por voz (sin listas ni markdown).';
 
-async function callGroq(model, normalizedText, history) {
+async function callGroq(model, normalizedText, history, memoria, tono) {
   const historyMessages = history.map((turn) => ({
     role: turn.role === 'model' ? 'assistant' : 'user',
     content: turn.text,
   }));
+
+  const toneAddendum =
+    tono === 'serio'
+      ? '\n\nMODO SERIO ACTIVADO: por ahora deja el sarcasmo y el humor negro completamente de lado. Responde directo, formal, sin bromas ni comentarios irónicos, como un asistente de trabajo/estudio normal.'
+      : '';
+
+  const systemFinal = `${SYSTEM_INSTRUCTION}${memoria ? `\n\n${memoria}` : ''}${toneAddendum}`;
 
   const response = await fetch(GROQ_URL, {
     method: 'POST',
@@ -50,7 +57,7 @@ async function callGroq(model, normalizedText, history) {
     body: JSON.stringify({
       model,
       messages: [
-        { role: 'system', content: SYSTEM_INSTRUCTION },
+        { role: 'system', content: systemFinal },
         ...historyMessages,
         { role: 'user', content: normalizedText },
       ],
@@ -70,7 +77,7 @@ async function callGroq(model, normalizedText, history) {
 // Endpoint principal que usa la app de ORION
 app.post('/chat', async (req, res) => {
   try {
-    const { texto, historial } = req.body;
+    const { texto, historial, memoria, tono } = req.body;
 
     if (!texto || typeof texto !== 'string') {
       return res.status(400).json({ error: 'Falta el campo "texto" en el body.' });
@@ -82,11 +89,11 @@ app.post('/chat', async (req, res) => {
 
     let data;
     try {
-      data = await callGroq(GROQ_MODEL_PRIMARY, texto, historial || []);
+      data = await callGroq(GROQ_MODEL_PRIMARY, texto, historial || [], memoria, tono);
     } catch (primaryError) {
       const isModelIssue = primaryError.status === 403 || primaryError.status === 404;
       if (!isModelIssue) throw primaryError;
-      data = await callGroq(GROQ_MODEL_FALLBACK, texto, historial || []);
+      data = await callGroq(GROQ_MODEL_FALLBACK, texto, historial || [], memoria, tono);
     }
 
     const text =

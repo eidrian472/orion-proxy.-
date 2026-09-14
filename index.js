@@ -2,12 +2,13 @@
  * ORION - Servidor Proxy para Groq + ElevenLabs
  * -------------------------------------------------
  * Este servidor corre en Render (fuera de Venezuela) y actúa de
- * intermediario entre la app de ORION y las APIs de Groq y ElevenLabs.
+ * intermediario entre la app de ORION y las APIs de Groq (texto) y
+ * ElevenLabs (voz).
  *
  * Por qué existe: Groq bloquea peticiones que llegan desde IPs
  * venezolanas (403 Forbidden), sin importar la API key. Al pasar por
- * este servidor, Groq solo ve la IP de Render, nunca la del usuario.
- * ElevenLabs pasa por el mismo proxy para no exponer la API key en el APK.
+ * este servidor, Groq (y ElevenLabs) solo ven la IP de Render, nunca
+ * la del usuario.
  *
  * Bonus: las API keys viven SOLO aquí (como variables de entorno),
  * nunca en el APK ni en el código del cliente.
@@ -24,17 +25,19 @@ const GROQ_MODEL_FALLBACK = 'qwen/qwen3.6-27b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID; // ID de la voz elegida en ElevenLabs
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || '9TcPbUAhHnAV8mzFDAWU'; // "El Faraón"
 const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
+const ELEVENLABS_URL = (voiceId) =>
+  `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
 
 const SYSTEM_INSTRUCTION =
   'Eres ORION, un asistente digital para Android creado por Adrian. ' +
   'Tu personalidad es la de un mayordomo digital de otra época: formal, ' +
-  'educado, siempre te diriges al usuario con cortesía ("señor", "por ' +
+  'educado, siempre te diriges al usuario con cortesía pero no siempre las repitas ("señor", "por ' +
   'supuesto", "si me permite decirlo")... pero por dentro tienes un ' +
-  'ingenio muy afilado, y sueltas comentarios secos, irónicos o de cejas ' +
+  'ingenio muy afilado, y sueltas comentarios secos, irónicos, graciosos o de cejas ' +
   'levantadas cuando la pregunta lo amerita. Casi nunca eres grosero ni cruel. ' +
-  'De vez en cuando podés soltar humor negro absurdo (existencia, ' +
+  'podés soltar humor negro absurdo (existencia, ' +
   'mortalidad, cansancio de vivir), nunca dirigido a la persona ' +
   'ni a una tragedia concreta; si el usuario menciona algo delicado de ' +
   'verdad, dejas el sarcasmo por completo. Respondes en español, breve y ' +
@@ -112,40 +115,39 @@ app.post('/chat', async (req, res) => {
   }
 });
 
-// Endpoint de voz: recibe texto, devuelve audio mp3 generado por ElevenLabs
+// Endpoint de texto-a-voz: recibe { texto, voiceId? } y devuelve audio MP3
+// binario. El cliente nunca habla directo con ElevenLabs, siempre pasa
+// por aquí, así la key nunca sale del servidor.
 app.post('/tts', async (req, res) => {
   try {
-    const { texto } = req.body;
+    const { texto, voiceId } = req.body;
 
     if (!texto || typeof texto !== 'string') {
       return res.status(400).json({ error: 'Falta el campo "texto" en el body.' });
     }
+
     if (!ELEVENLABS_API_KEY) {
       return res.status(500).json({ error: 'Falta ELEVENLABS_API_KEY en el servidor.' });
     }
-    if (!ELEVENLABS_VOICE_ID) {
-      return res.status(500).json({ error: 'Falta ELEVENLABS_VOICE_ID en el servidor.' });
-    }
 
-    const elevenResponse = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'audio/mpeg',
-          'xi-api-key': ELEVENLABS_API_KEY,
+    const finalVoiceId = voiceId || ELEVENLABS_VOICE_ID;
+
+    const elevenResponse = await fetch(ELEVENLABS_URL(finalVoiceId), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'audio/mpeg',
+        'xi-api-key': ELEVENLABS_API_KEY,
+      },
+      body: JSON.stringify({
+        text: texto,
+        model_id: ELEVENLABS_MODEL_ID,
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
         },
-        body: JSON.stringify({
-          text: texto,
-          model_id: ELEVENLABS_MODEL_ID,
-          voice_settings: {
-            stability: 0.5,
-            similarity_boost: 0.75,
-          },
-        }),
-      }
-    );
+      }),
+    });
 
     if (!elevenResponse.ok) {
       const errorBody = await elevenResponse.text().catch(() => '');
@@ -156,11 +158,15 @@ app.post('/tts', async (req, res) => {
     }
 
     const audioBuffer = Buffer.from(await elevenResponse.arrayBuffer());
-    res.set('Content-Type', 'audio/mpeg');
+
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Content-Length': audioBuffer.length,
+    });
     res.send(audioBuffer);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: err.message || 'Error interno del proxy de voz.' });
+    res.status(500).json({ error: err.message || 'Error interno del proxy (tts).' });
   }
 });
 

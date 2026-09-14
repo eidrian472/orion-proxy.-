@@ -1,14 +1,15 @@
 /**
- * ORION - Servidor Proxy para Groq
+ * ORION - Servidor Proxy para Groq + ElevenLabs
  * -------------------------------------------------
  * Este servidor corre en Render (fuera de Venezuela) y actúa de
- * intermediario entre la app de ORION y la API de Groq.
+ * intermediario entre la app de ORION y las APIs de Groq y ElevenLabs.
  *
  * Por qué existe: Groq bloquea peticiones que llegan desde IPs
  * venezolanas (403 Forbidden), sin importar la API key. Al pasar por
  * este servidor, Groq solo ve la IP de Render, nunca la del usuario.
+ * ElevenLabs pasa por el mismo proxy para no exponer la API key en el APK.
  *
- * Bonus: la API key de Groq vive SOLO aquí (como variable de entorno),
+ * Bonus: las API keys viven SOLO aquí (como variables de entorno),
  * nunca en el APK ni en el código del cliente.
  */
 
@@ -21,6 +22,10 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL_PRIMARY = 'openai/gpt-oss-120b';
 const GROQ_MODEL_FALLBACK = 'qwen/qwen3.6-27b';
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID; // ID de la voz elegida en ElevenLabs
+const ELEVENLABS_MODEL_ID = process.env.ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
 
 const SYSTEM_INSTRUCTION =
   'Eres ORION, un asistente digital para Android creado por Adrian. ' +
@@ -104,6 +109,58 @@ app.post('/chat', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Error interno del proxy.' });
+  }
+});
+
+// Endpoint de voz: recibe texto, devuelve audio mp3 generado por ElevenLabs
+app.post('/tts', async (req, res) => {
+  try {
+    const { texto } = req.body;
+
+    if (!texto || typeof texto !== 'string') {
+      return res.status(400).json({ error: 'Falta el campo "texto" en el body.' });
+    }
+    if (!ELEVENLABS_API_KEY) {
+      return res.status(500).json({ error: 'Falta ELEVENLABS_API_KEY en el servidor.' });
+    }
+    if (!ELEVENLABS_VOICE_ID) {
+      return res.status(500).json({ error: 'Falta ELEVENLABS_VOICE_ID en el servidor.' });
+    }
+
+    const elevenResponse = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'audio/mpeg',
+          'xi-api-key': ELEVENLABS_API_KEY,
+        },
+        body: JSON.stringify({
+          text: texto,
+          model_id: ELEVENLABS_MODEL_ID,
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+          },
+        }),
+      }
+    );
+
+    if (!elevenResponse.ok) {
+      const errorBody = await elevenResponse.text().catch(() => '');
+      console.error(`ElevenLabs failed: ${elevenResponse.status} ${errorBody}`);
+      return res
+        .status(elevenResponse.status)
+        .json({ error: `ElevenLabs respondió ${elevenResponse.status}: ${errorBody}` });
+    }
+
+    const audioBuffer = Buffer.from(await elevenResponse.arrayBuffer());
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(audioBuffer);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Error interno del proxy de voz.' });
   }
 });
 

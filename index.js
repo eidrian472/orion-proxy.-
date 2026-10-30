@@ -15,6 +15,9 @@
  *
  * NUEVO: /chat acepta una foto adjunta (campo "imagen") y en ese caso
  * usa un modelo con visión (variable de entorno GROQ_VISION_MODEL).
+ *
+ * NUEVO: /agent (modo live con control del teléfono). Vive en el archivo
+ * proxy_agent.js, que debe estar en la misma carpeta que este index.js.
  */
 
 const express = require('express');
@@ -308,6 +311,12 @@ app.post('/tts', async (req, res) => {
     return res.status(500).json({ error: `No se pudo generar la voz: ${err.message}` });
   }
 });
+
+// ---------------------------------------------------------------------
+// Modo live: endpoint /agent (la IA decide un paso a la vez y la app lo
+// ejecuta en el teléfono). El código está en proxy_agent.js.
+// ---------------------------------------------------------------------
+require('./proxy_agent')(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISION_MODEL });
 
 // Endpoint de salud, para revisar que el servidor está vivo desde el navegador
 app.get('/', (req, res) => {

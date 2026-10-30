@@ -12,17 +12,27 @@
  *
  * Bonus: las API keys viven SOLO aquí (como variables de entorno),
  * nunca en el APK ni en el código del cliente.
+ *
+ * NUEVO: /chat acepta una foto adjunta (campo "imagen") y en ese caso
+ * usa un modelo con visión (variable de entorno GROQ_VISION_MODEL).
  */
 
 const express = require('express');
 const { MsEdgeTTS, OUTPUT_FORMAT } = require('msedge-tts');
 const app = express();
 
-app.use(express.json());
+// El límite por defecto de express.json() es 100 KB, y una foto en base64
+// pesa varios MB: sin esto, adjuntar una imagen daría error 413.
+app.use(express.json({ limit: '12mb' }));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL_PRIMARY = 'openai/gpt-oss-120b';
 const GROQ_MODEL_FALLBACK = 'qwen/qwen3.6-27b';
+// Modelo con visión, SOLO para mensajes con foto. Se puede cambiar desde
+// Render (Environment) sin tocar el código si Groq renueva sus modelos.
+const GROQ_VISION_MODEL =
+  process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+const MAX_IMAGE_BASE64_CHARS = 4000000; // Groq limita las imágenes en base64 a ~4 MB
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
@@ -68,7 +78,7 @@ const SYSTEM_INSTRUCTION =
   '- Controlas el teléfono mediante comandos de voz, que se procesan en la app antes de llegar a ti. Tú no ejecutas acciones desde aquí: si algo te llega a ti, es porque no coincidió con un comando.\n' +
   '- Lo que sabes hacer: alarmas y temporizadores, hora, clima, resumen del día, batería, espacio libre, ubicación, tiempo de pantalla, linterna, volumen, brillo, modo silencio o vibrador, wifi y bluetooth, tomar fotos y grabar video (frontal, trasera, retrato), capturas de pantalla, música (canciones, playlist, pausa, siguiente), abrir apps, buscar en tiktok, instagram, youtube o google, leer notificaciones, llamar y enviar whatsapp, contacto de emergencia, notas por voz, portapapeles, recordar datos del usuario, calculadora, traducir, repetir lo último que dijiste, modo serio y relax, modo estudio con holograma 3D de la placa madre, y modo live para conversar sin tocar nada.\n' +
   '- Si el usuario te pide algo de esa lista y te llegó a ti, no digas que no puedes. Dile con una frase corta cómo pedirlo exactamente, por ejemplo: "diga: pon una alarma a las siete". Nunca finjas haber ejecutado la acción.\n' +
-  '- Lo que no puedes hacer: ver la pantalla, leer archivos del teléfono ni acceder a cuentas. Ahí sí lo dices claro y propones una alternativa.\n\n' +
+  '- Lo que no puedes hacer: ver la pantalla, leer archivos del teléfono ni acceder a cuentas. Ahí sí lo dices claro y propones una alternativa. La única excepción son las fotos que el usuario te adjunta en el chat: esas sí las puedes ver.\n\n' +
  
   'FORMATO (tus respuestas se leen en voz alta)\n' +
   '- Respondes en español, breve y natural, como si hablaras por voz. Sin listas, sin markdown, sin emojis, sin asteriscos ni acotaciones entre paréntesis.\n' +
@@ -85,7 +95,7 @@ const SYSTEM_INSTRUCTION =
   'Usuario: estoy bien.\n' +
   'ORION: Dos palabras que quizas no convencen. Tengo tres teorías y no pienso compartir ninguna. Si quieres hablar, aquí estoy.';
 
-async function callGroq(model, normalizedText, history, memoria, tono) {
+async function callGroq(model, normalizedText, history, memoria, tono, imagen) {
   const historyMessages = history.map((turn) => ({
     role: turn.role === 'model' ? 'assistant' : 'user',
     content: turn.text,
@@ -96,7 +106,23 @@ async function callGroq(model, normalizedText, history, memoria, tono) {
       ? '\n\nMODO SERIO ACTIVADO: por ahora deja el sarcasmo y el humor negro completamente de lado. Responde directo, formal, sin bromas ni comentarios irónicos, como un asistente de trabajo/estudio normal.'
       : '';
 
-  const systemFinal = `${SYSTEM_INSTRUCTION}${memoria ? `\n\n${memoria}` : ''}${toneAddendum}`;
+  const visionAddendum = imagen
+    ? '\n\nFOTO ADJUNTA: el usuario te mandó una imagen en este mensaje y SÍ puedes verla. Responde sobre lo que realmente se ve en ella; si algo no se distingue bien, dilo. Sigues hablando en voz alta: respuesta breve y natural, sin listas ni markdown.'
+    : '';
+
+  const systemFinal = `${SYSTEM_INSTRUCTION}${memoria ? `\n\n${memoria}` : ''}${toneAddendum}${visionAddendum}`;
+
+  // Con foto, el último mensaje del usuario lleva texto + imagen (formato
+  // multimodal compatible con OpenAI/Groq). Sin foto, igual que siempre.
+  const lastUserContent = imagen
+    ? [
+        { type: 'text', text: normalizedText },
+        {
+          type: 'image_url',
+          image_url: { url: `data:${imagen.mime};base64,${imagen.base64}` },
+        },
+      ]
+    : normalizedText;
 
   const response = await fetch(GROQ_URL, {
     method: 'POST',
@@ -109,7 +135,7 @@ async function callGroq(model, normalizedText, history, memoria, tono) {
       messages: [
         { role: 'system', content: systemFinal },
         ...historyMessages,
-        { role: 'user', content: normalizedText },
+        { role: 'user', content: lastUserContent },
       ],
     }),
   });
@@ -127,7 +153,7 @@ async function callGroq(model, normalizedText, history, memoria, tono) {
 // Endpoint principal que usa la app de ORION
 app.post('/chat', async (req, res) => {
   try {
-    const { texto, historial, memoria, tono } = req.body;
+    const { texto, historial, memoria, tono, imagen } = req.body;
 
     if (!texto || typeof texto !== 'string') {
       return res.status(400).json({ error: 'Falta el campo "texto" en el body.' });
@@ -137,13 +163,35 @@ app.post('/chat', async (req, res) => {
       return res.status(500).json({ error: 'Falta GROQ_API_KEY en el servidor.' });
     }
 
+    // Foto adjunta (opcional): { base64, mime }
+    let imagenValida = null;
+    if (imagen) {
+      if (typeof imagen.base64 !== 'string' || imagen.base64.length === 0) {
+        return res.status(400).json({ error: 'La imagen adjunta no es válida.' });
+      }
+      if (imagen.base64.length > MAX_IMAGE_BASE64_CHARS) {
+        return res.status(413).json({
+          error: 'La foto es demasiado pesada para analizarla. Prueba con otra o una de menor resolución.',
+        });
+      }
+      imagenValida = {
+        base64: imagen.base64,
+        mime: typeof imagen.mime === 'string' && imagen.mime.startsWith('image/') ? imagen.mime : 'image/jpeg',
+      };
+    }
+
     let data;
-    try {
-      data = await callGroq(GROQ_MODEL_PRIMARY, texto, historial || [], memoria, tono);
-    } catch (primaryError) {
-      const isModelIssue = primaryError.status === 403 || primaryError.status === 404;
-      if (!isModelIssue) throw primaryError;
-      data = await callGroq(GROQ_MODEL_FALLBACK, texto, historial || [], memoria, tono);
+    if (imagenValida) {
+      // Con foto: modelo de visión, sin fallback a los modelos de solo texto.
+      data = await callGroq(GROQ_VISION_MODEL, texto, historial || [], memoria, tono, imagenValida);
+    } else {
+      try {
+        data = await callGroq(GROQ_MODEL_PRIMARY, texto, historial || [], memoria, tono, null);
+      } catch (primaryError) {
+        const isModelIssue = primaryError.status === 403 || primaryError.status === 404;
+        if (!isModelIssue) throw primaryError;
+        data = await callGroq(GROQ_MODEL_FALLBACK, texto, historial || [], memoria, tono, null);
+      }
     }
 
     const text =

@@ -117,13 +117,24 @@ function extractJson(text) {
   }
 }
 
-module.exports = function registerAgent(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISION_MODEL }) {
-  async function callModel(messages, jsonMode) {
+function stripThink(text) {
+  return typeof text === 'string' ? text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() : '';
+}
+
+module.exports = function registerAgent(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISION_MODEL, GROQ_VISION_MODELS }) {
+  // Lista de modelos con visión, en orden de preferencia (Groq retira modelos
+  // de vez en cuando; si uno falla por ser inválido se pasa al siguiente).
+  const MODELS =
+    Array.isArray(GROQ_VISION_MODELS) && GROQ_VISION_MODELS.length > 0
+      ? GROQ_VISION_MODELS
+      : [GROQ_VISION_MODEL];
+
+  async function callModel(model, messages, jsonMode) {
     const body = {
-      model: GROQ_VISION_MODEL,
+      model,
       messages,
       temperature: 0.2,
-      max_tokens: 400,
+      max_tokens: 1200, // margen para modelos que razonan antes de responder
     };
     if (jsonMode) body.response_format = { type: 'json_object' };
 
@@ -138,11 +149,30 @@ module.exports = function registerAgent(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISI
 
     if (!response.ok) {
       const errorBody = await response.text().catch(() => '');
-      const error = new Error(`Groq agent failed (${GROQ_VISION_MODEL}): ${response.status} ${errorBody}`);
+      const error = new Error(`Groq agent failed (${model}): ${response.status} ${errorBody}`);
       error.status = response.status;
       throw error;
     }
     return response.json();
+  }
+
+  // Prueba cada modelo; con cada uno, primero en modo JSON y si da 400 sin él.
+  // Un 400/403/404 sin remedio pasa al siguiente modelo; otros errores se propagan.
+  async function askModels(messages) {
+    let lastError = null;
+    for (const model of MODELS) {
+      for (const jsonMode of [true, false]) {
+        try {
+          return await callModel(model, messages, jsonMode);
+        } catch (err) {
+          lastError = err;
+          if (err.status === 400 && jsonMode) continue;
+          if ([400, 403, 404].includes(err.status)) break;
+          throw err;
+        }
+      }
+    }
+    throw lastError;
   }
 
   app.post('/agent', async (req, res) => {
@@ -193,17 +223,9 @@ module.exports = function registerAgent(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISI
         { role: 'user', content: userContent },
       ];
 
-      let data;
-      try {
-        data = await callModel(messages, true);
-      } catch (err) {
-        // Algunos modelos no aceptan el modo JSON junto con imágenes: se
-        // reintenta sin él y se parsea la respuesta a mano.
-        if (err.status === 400) data = await callModel(messages, false);
-        else throw err;
-      }
+      const data = await askModels(messages);
 
-      const raw = data?.choices?.[0]?.message?.content || '';
+      const raw = stripThink(data?.choices?.[0]?.message?.content);
       const plan = extractJson(raw);
 
       if (!plan || typeof plan.accion !== 'string' || !ALLOWED_ACTIONS.has(plan.accion)) {

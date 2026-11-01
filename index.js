@@ -33,8 +33,19 @@ const GROQ_MODEL_PRIMARY = 'openai/gpt-oss-120b';
 const GROQ_MODEL_FALLBACK = 'qwen/qwen3.6-27b';
 // Modelo con visión, SOLO para mensajes con foto. Se puede cambiar desde
 // Render (Environment) sin tocar el código si Groq renueva sus modelos.
-const GROQ_VISION_MODEL =
-  process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+// Groq retiró llama-4-scout: ahora se prueba en orden (el de Render si existe,
+// luego los modelos con visión vigentes) y se usa el primero que responda.
+const GROQ_VISION_MODELS = [
+  process.env.GROQ_VISION_MODEL,
+  'qwen/qwen3.8-27b',
+  'qwen/qwen3.6-27b',
+].filter((m, i, arr) => m && arr.indexOf(m) === i);
+const GROQ_VISION_MODEL = GROQ_VISION_MODELS[0];
+
+// Los modelos qwen pueden devolver su razonamiento entre <think>...</think>.
+function stripThink(text) {
+  return typeof text === 'string' ? text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() : '';
+}
 const MAX_IMAGE_BASE64_CHARS = 4000000; // Groq limita las imágenes en base64 a ~4 MB
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -185,8 +196,21 @@ app.post('/chat', async (req, res) => {
 
     let data;
     if (imagenValida) {
-      // Con foto: modelo de visión, sin fallback a los modelos de solo texto.
-      data = await callGroq(GROQ_VISION_MODEL, texto, historial || [], memoria, tono, imagenValida);
+      // Con foto: modelos de visión (sin caer a los de solo texto). Si uno
+      // está retirado o no existe (400/403/404), se prueba el siguiente.
+      let lastVisionError = null;
+      for (const visionModel of GROQ_VISION_MODELS) {
+        try {
+          data = await callGroq(visionModel, texto, historial || [], memoria, tono, imagenValida);
+          lastVisionError = null;
+          break;
+        } catch (visionError) {
+          lastVisionError = visionError;
+          console.error(`Vision falló con ${visionModel}:`, String(visionError.message).slice(0, 300));
+          if (![400, 403, 404].includes(visionError.status)) throw visionError;
+        }
+      }
+      if (lastVisionError) throw lastVisionError;
     } else {
       try {
         data = await callGroq(GROQ_MODEL_PRIMARY, texto, historial || [], memoria, tono, null);
@@ -198,7 +222,7 @@ app.post('/chat', async (req, res) => {
     }
 
     const text =
-      data?.choices?.[0]?.message?.content?.trim() ||
+      stripThink(data?.choices?.[0]?.message?.content) ||
       'No se me ocurrió nada para eso, la verdad.';
 
     res.json({ action: 'REPLY_TEXT', text });
@@ -316,7 +340,7 @@ app.post('/tts', async (req, res) => {
 // Modo live: endpoint /agent (la IA decide un paso a la vez y la app lo
 // ejecuta en el teléfono). El código está en proxy_agent.js.
 // ---------------------------------------------------------------------
-require('./proxy_agent')(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISION_MODEL });
+require('./proxy_agent')(app, { GROQ_API_KEY, GROQ_URL, GROQ_VISION_MODEL, GROQ_VISION_MODELS });
 
 // Endpoint de salud, para revisar que el servidor está vivo desde el navegador
 app.get('/', (req, res) => {
